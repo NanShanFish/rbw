@@ -209,6 +209,12 @@ enum Opt {
     Edit {
         #[command(flatten)]
         find_args: FindArgs,
+        #[arg(
+            short = 'f',
+            long,
+            help = "Edit a single field (e.g. username, name, notes, totp, or a custom field name)"
+        )]
+        field: Option<String>,
     },
 
     #[command(about = "Remove a given entry", visible_alias = "rm")]
@@ -430,10 +436,11 @@ fn main() {
                 ty,
             )
         }
-        Opt::Edit { find_args } => commands::edit(
+        Opt::Edit { find_args, field } => commands::edit(
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
+            field.as_deref(),
             find_args.ignorecase,
         ),
         Opt::Remove { find_args } => commands::remove(
