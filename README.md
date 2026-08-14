@@ -19,55 +19,64 @@ occur, I am unlikely to spend time implementing new features on my own. If you
 would like to see new functionality in `rbw`, I am more than happy to review
 and merge pull requests implementing those features.
 
-## Installation
+## This fork
 
-### Arch Linux
+This is a personal fork (`NanShanFish/rbw`) based on rbw `1.15.0`. The
+upstream project is maintained, but new features are not a priority there, so
+the changes below are carried on this branch for daily use. They have also been
+submitted upstream where applicable, but are not guaranteed to be merged.
 
-`rbw` is available in the [extra
-repository](https://archlinux.org/packages/extra/x86_64/rbw/).
-Alternatively, you can install
-[`rbw-git`](https://aur.archlinux.org/packages/rbw-git/) from the AUR, which
-will always build from the latest master commit.
+### Changes relative to upstream
 
-### Debian/Ubuntu
+* **Clear error when the refresh token is rejected** — a revoked/expired
+  refresh token previously surfaced as a cryptic
+  `failed to parse JSON: missing field access_token`, hiding the real cause.
+  This fork reports an actionable message telling you to run `rbw purge` and
+  then `rbw login`. (upstream PR
+  [doy/rbw#362](https://github.com/doy/rbw/pull/362))
 
-`rbw` is officially packaged for Debian as
-[`rust-rbw`](https://tracker.debian.org/pkg/rust-rbw) and is available in
-testing (forky). You can install it using `sudo apt install rbw`.
+* **Fix editing entries with an individual encryption key** — `rbw edit` used
+  to corrupt entries that carry a `key` field (item key): the edited fields
+  were re-encrypted with the wrong key while the stale item key was kept, so no
+  client could decrypt the entry anymore. Editing now encrypts with the item
+  key and preserves the `key` field. (upstream issue
+  [doy/rbw#364](https://github.com/doy/rbw/issues/364), PR
+  [doy/rbw#366](https://github.com/doy/rbw/pull/366))
 
-Alternatively, you can download a Debian package from
-[https://git.tozt.net/rbw/releases/deb/
-](https://git.tozt.net/rbw/releases/deb/). The packages are signed by
-[`minisign`](https://github.com/jedisct1/minisign), and can be verified using
-the public key `RWTM0AZ5RpROOfAIWx1HvYQ6pw1+FKwN6526UFTKNImP/Hz3ynCFst3r`.
+* **`rbw edit --field`** — edit a single field (username, name, notes,
+  password, totp, uris, or a custom field) instead of only password + notes,
+  mirroring `rbw get --field`. URIs are edited one per line and existing URI
+  match types are preserved. (upstream issue
+  [doy/rbw#365](https://github.com/doy/rbw/issues/365), PR
+  [doy/rbw#367](https://github.com/doy/rbw/pull/367))
 
-### Fedora/EPEL
+* **`rbw-dbcheck`** — a small diagnostic tool that unlocks your local vault and
+  reports which entries fail to decrypt, to detect vault corruption.
 
-`rbw` is available in [Fedora and EPEL 9](https://bodhi.fedoraproject.org/updates/?packages=rust-rbw)
-(for RHEL and compatible distributions).
+### Installation / deployment
 
-You can install it using `sudo dnf install rbw`.
+#### Build from source
 
-### Homebrew
+```sh
+git clone git@github.com:NanShanFish/rbw.git
+cd rbw
+cargo build --release --locked
+```
 
-`rbw` is available in the [Homebrew repository](https://formulae.brew.sh/formula/rbw). You can install it via `brew install rbw`.
+#### Install the binaries
 
-### Nix
+Replace the system binaries (adjust the destination if you are not on Arch
+Linux; `/usr/sbin` works on most distros):
 
-`rbw` is available in the
-[NixOS repository](https://search.nixos.org/packages?show=rbw). You can try
-it out via `nix-shell -p rbw`.
+```sh
+sudo install -m755 target/release/rbw target/release/rbw-agent /usr/sbin/
+sudo install -m755 target/release/rbw-dbcheck /usr/sbin/   # optional
+```
 
-### Alpine
-
-`rbw` is available in the [community repository](https://pkgs.alpinelinux.org/packages?name=rbw). You can install it with `apk add rbw`.
-
-### Other
-
-With a working Rust installation, `rbw` can be installed via `cargo install
---locked rbw`. This requires that the
-[`pinentry`](https://www.gnupg.org/related_software/pinentry/index.en.html)
-program is installed (to display password prompts).
+Note: the `rbw` CLI and `rbw-agent` must be built together — they negotiate a
+protocol version at startup, and mismatched binaries will refuse to talk to
+each other. If an agent from an older build is already running, stop it once
+after installing (`rbw stop-agent`) so the new binaries start.
 
 ## Configuration
 
