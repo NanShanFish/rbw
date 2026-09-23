@@ -167,6 +167,19 @@ export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/rbw/ssh-agent-socket"
 If you're using a profile, the socket will be located at
 `"$XDG_RUNTIME_DIR/rbw-<profile>/ssh-agent-socket"`.
 
+After the first unlock, rbw stores a profile- and account-specific cache of
+SSH public keys. The cache contains only normalized public keys (without
+comments), is written with mode `0600`, and lets `request_identities` and
+`ssh-add -L` work while the Vault is locked. This avoids an extra database
+unlock prompt before the signature confirmation. After upgrading from an
+older rbw version, run `rbw unlock` once to create the cache.
+
+`rbw lock` preserves the public-key cache; `rbw purge` removes it. If a
+background sync completes while the Vault is locked, the cache may keep the
+previous identity list until the next unlock. A removed key can therefore be
+offered once, but signing still checks the current encrypted Vault and fails
+closed. New keys appear after the next unlock.
+
 If `ssh_agent_confirmation` is `always` (the default), every signature
 request opens pinentry and shows the direct process connected to the agent,
 its PID when available, and the requested key fingerprint. SSH authorization,
@@ -180,9 +193,9 @@ rbw config set ssh_agent_confirmation never
 ```
 
 This does not disable the initial database unlock prompt or item-level master
-password re-prompts. Listing identities with `ssh-add -L` does not trigger the
-additional per-signature confirmation, but it still prompts to unlock a locked
-database.
+password re-prompts. Listing identities with `ssh-add -L` never triggers the
+additional per-signature confirmation. Once the public-key cache exists, it
+also does not need to unlock the database.
 
 The process shown is the direct Unix socket peer. For example, when OpenSSH
 is used it will normally be `ssh`, not the application that started `ssh`.

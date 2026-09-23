@@ -2205,6 +2205,7 @@ pub fn purge() -> anyhow::Result<()> {
     stop_agent()?;
 
     remove_db()?;
+    remove_ssh_agent_cache()?;
 
     Ok(())
 }
@@ -2938,6 +2939,14 @@ fn remove_db() -> anyhow::Result<()> {
             rbw::db::Db::remove(&config.server_name(), email)
                 .map_err(anyhow::Error::new)
         },
+    )
+}
+
+fn remove_ssh_agent_cache() -> anyhow::Result<()> {
+    let config = rbw::config::Config::load()?;
+    config.email.as_ref().map_or_else(
+        || Err(anyhow::anyhow!("failed to find email address in config")),
+        |email| rbw::ssh_agent_cache::remove(&config.server_name(), email),
     )
 }
 

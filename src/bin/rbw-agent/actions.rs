@@ -368,6 +368,10 @@ async fn login_success(
         Err(e) => return Err(e).context("failed to unlock database"),
     }
 
+    if let Err(e) = refresh_ssh_public_key_cache(state).await {
+        eprintln!("failed to refresh SSH public key cache: {e:#}");
+    }
+
     Ok(())
 }
 
@@ -583,7 +587,11 @@ pub async fn unlock(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
-    unlock_state(state, environment).await?;
+    unlock_state(state.clone(), environment).await?;
+
+    if let Err(e) = refresh_ssh_public_key_cache(state).await {
+        eprintln!("failed to refresh SSH public key cache: {e:#}");
+    }
 
     respond_ack(sock).await?;
 
@@ -645,6 +653,19 @@ pub async fn sync(
     db.protected_org_keys = protected_org_keys;
     db.entries = entries;
     save_db(&db).await?;
+
+    if !state.lock().await.needs_unlock() {
+        if let Err(e) =
+            refresh_ssh_public_key_cache_from_db(state.clone(), &db).await
+        {
+            eprintln!("failed to refresh SSH public key cache: {e:#}");
+            if let Err(remove_error) = remove_ssh_public_key_cache().await {
+                eprintln!(
+                    "failed to remove stale SSH public key cache: {remove_error:#}"
+                );
+            }
+        }
+    }
 
     if let Err(e) = subscribe_to_notifications(state.clone()).await {
         eprintln!("failed to subscribe to notifications: {e}");
@@ -905,6 +926,44 @@ async fn save_db(db: &rbw::db::Db) -> anyhow::Result<()> {
     }
 }
 
+async fn ssh_agent_cache_account() -> anyhow::Result<(String, String)> {
+    let config = rbw::config::Config::load_async().await?;
+    let email = config
+        .email
+        .clone()
+        .context("failed to find email address in config")?;
+    Ok((config.server_name(), email))
+}
+
+async fn load_ssh_public_key_cache() -> anyhow::Result<Option<Vec<String>>> {
+    let (server, email) = ssh_agent_cache_account().await?;
+    tokio::task::spawn_blocking(move || {
+        rbw::ssh_agent_cache::load(&server, &email)
+    })
+    .await
+    .context("SSH agent cache read task failed")?
+}
+
+async fn save_ssh_public_key_cache(
+    public_keys: Vec<String>,
+) -> anyhow::Result<()> {
+    let (server, email) = ssh_agent_cache_account().await?;
+    tokio::task::spawn_blocking(move || {
+        rbw::ssh_agent_cache::save(&server, &email, &public_keys)
+    })
+    .await
+    .context("SSH agent cache write task failed")?
+}
+
+async fn remove_ssh_public_key_cache() -> anyhow::Result<()> {
+    let (server, email) = ssh_agent_cache_account().await?;
+    tokio::task::spawn_blocking(move || {
+        rbw::ssh_agent_cache::remove(&server, &email)
+    })
+    .await
+    .context("SSH agent cache removal task failed")?
+}
+
 async fn config_base_url() -> anyhow::Result<String> {
     let config = rbw::config::Config::load_async().await?;
     Ok(config.base_url())
@@ -947,40 +1006,86 @@ pub async fn subscribe_to_notifications(
         .map_or_else(|| Ok(()), |err| Err(anyhow::anyhow!(err.to_string())))
 }
 
+fn canonical_ssh_public_key(plaintext: &str) -> anyhow::Result<String> {
+    let parsed = ssh_agent_lib::ssh_key::PublicKey::from_openssh(plaintext)
+        .context("failed to parse SSH public key")?;
+    ssh_agent_lib::ssh_key::PublicKey::new(parsed.key_data().clone(), "")
+        .to_openssh()
+        .context("failed to serialize SSH public key")
+}
+
+fn decrypt_ssh_public_keys(
+    state: &crate::state::State,
+    db: &rbw::db::Db,
+) -> anyhow::Result<Vec<String>> {
+    let mut public_keys = Vec::new();
+    for entry in &db.entries {
+        let rbw::db::EntryData::SshKey {
+            public_key: Some(encrypted),
+            ..
+        } = &entry.data
+        else {
+            continue;
+        };
+        let keys = state.key(entry.org_id.as_deref()).ok_or_else(|| {
+            anyhow::anyhow!("failed to find SSH public key decryption keys")
+        })?;
+        let plaintext =
+            decrypt_cipher_with_keys(keys, encrypted, entry.key.as_deref())?;
+        public_keys.push(canonical_ssh_public_key(&plaintext)?);
+    }
+    Ok(public_keys)
+}
+
+async fn refresh_ssh_public_key_cache_from_db(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    db: &rbw::db::Db,
+) -> anyhow::Result<Vec<String>> {
+    let public_keys = {
+        let state = state.lock().await;
+        if state.needs_unlock() {
+            return Err(anyhow::anyhow!(
+                "cannot refresh SSH public key cache while agent is locked"
+            ));
+        }
+        decrypt_ssh_public_keys(&state, db)?
+    };
+    save_ssh_public_key_cache(public_keys.clone()).await?;
+    Ok(public_keys)
+}
+
+async fn refresh_ssh_public_key_cache(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<Vec<String>> {
+    let db = load_db().await?;
+    refresh_ssh_public_key_cache_from_db(state, &db).await
+}
+
 pub async fn get_ssh_public_keys(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<Vec<String>> {
+    match load_ssh_public_key_cache().await {
+        Ok(Some(public_keys)) => return Ok(public_keys),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!(
+                "failed to load SSH public key cache, rebuilding: {e:#}"
+            );
+            if let Err(remove_error) = remove_ssh_public_key_cache().await {
+                eprintln!(
+                    "failed to remove invalid SSH public key cache: {remove_error:#}"
+                );
+            }
+        }
+    }
+
     let environment = {
         let state = state.lock().await;
         state.set_timeout();
         state.last_environment().clone()
     };
     unlock_state(state.clone(), &environment).await?;
-
-    let db = load_db().await?;
-    let mut pubkeys = Vec::new();
-
-    for entry in db.entries {
-        if let rbw::db::EntryData::SshKey {
-            public_key: Some(encrypted),
-            ..
-        } = &entry.data
-        {
-            let plaintext = decrypt_cipher(
-                state.clone(),
-                &environment,
-                encrypted,
-                entry.key.as_deref(),
-                entry.org_id.as_deref(),
-                false,
-            )
-            .await?;
-
-            pubkeys.push(plaintext);
-        }
-    }
-
-    Ok(pubkeys)
+    refresh_ssh_public_key_cache(state).await
 }
 
 async fn decrypt_ssh_cipher(
@@ -1123,6 +1228,15 @@ mod tests {
             .decrypt_symmetric(&master, None)
             .unwrap();
         assert_eq!(plain, b"secret");
+    }
+
+    #[test]
+    fn canonical_public_key_removes_comment() {
+        let with_comment = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA user@example";
+        assert_eq!(
+            canonical_ssh_public_key(with_comment).unwrap(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
     }
 
     #[test]

@@ -10,6 +10,9 @@
   this additional per-signature confirmation; database unlock and item-level
   master password prompts still apply. Abandoned signature confirmations time
   out after two minutes.
+* Cache normalized SSH public keys after unlock so identity enumeration does
+  not require unlocking the Vault. The per-profile, per-account cache contains
+  no private keys or entry metadata and is removed by `rbw purge`.
 
 ## [1.15.0] - 2025-12-31
 
