@@ -11,6 +11,8 @@ pub struct State {
     pub notifications_handler: crate::notifications::Handler,
     pub master_password_reprompt: std::collections::HashSet<[u8; 32]>,
     pub master_password_reprompt_initialized: bool,
+    pub pinentry_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub lock_generation: u64,
 
     // this is stored here specifically for the use of the ssh agent, because
     // requests made to the ssh agent don't include an environment, and so we
@@ -39,6 +41,23 @@ impl State {
         self.priv_key.is_none() || self.org_keys.is_none()
     }
 
+    pub fn lock_generation(&self) -> u64 {
+        self.lock_generation
+    }
+
+    pub fn ensure_lock_generation(
+        &self,
+        expected: u64,
+    ) -> anyhow::Result<()> {
+        if self.lock_generation == expected {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "operation cancelled because the agent was locked"
+            ))
+        }
+    }
+
     pub fn set_timeout(&self) {
         self.timeout.set(self.timeout_duration);
     }
@@ -46,6 +65,7 @@ impl State {
     pub fn clear(&mut self) {
         self.priv_key = None;
         self.org_keys = None;
+        self.lock_generation = self.lock_generation.wrapping_add(1);
         self.timeout.clear();
     }
 
@@ -142,5 +162,44 @@ impl State {
         environment: rbw::protocol::Environment,
     ) {
         self.last_environment = environment;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> State {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        State {
+            priv_key: None,
+            org_keys: None,
+            timeout,
+            timeout_duration: std::time::Duration::from_secs(60),
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::from_secs(60),
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            pinentry_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            lock_generation: 0,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_invalidates_in_flight_operations() {
+        let mut state = test_state();
+        let generation = state.lock_generation();
+        assert!(state.ensure_lock_generation(generation).is_ok());
+
+        state.clear();
+
+        assert!(state.ensure_lock_generation(generation).is_err());
+        assert_eq!(state.lock_generation(), generation.wrapping_add(1));
     }
 }

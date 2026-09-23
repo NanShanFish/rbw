@@ -27,8 +27,57 @@ impl SshAgent {
     }
 }
 
+#[derive(Clone)]
+struct SshAgentSession {
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    requester: String,
+}
+
+fn sanitize_process_name(name: &std::ffi::OsStr) -> String {
+    name.to_string_lossy()
+        .chars()
+        .take(128)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+')
+            {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+fn requester_name(socket: &tokio::net::UnixStream) -> String {
+    let Some(pid) = socket.peer_cred().ok().and_then(|cred| cred.pid())
+    else {
+        return "unknown process".to_string();
+    };
+
+    #[cfg(target_os = "linux")]
+    if let Ok(executable) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        if let Some(name) = executable.file_name() {
+            return format!("{} (pid {pid})", sanitize_process_name(name));
+        }
+    }
+
+    format!("process (pid {pid})")
+}
+
+impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for SshAgent {
+    fn new_session(
+        &mut self,
+        socket: &tokio::net::UnixStream,
+    ) -> impl ssh_agent_lib::agent::Session {
+        SshAgentSession {
+            state: self.state.clone(),
+            requester: requester_name(socket),
+        }
+    }
+}
+
 #[ssh_agent_lib::async_trait]
-impl ssh_agent_lib::agent::Session for SshAgent {
+impl ssh_agent_lib::agent::Session for SshAgentSession {
     async fn request_identities(
         &mut self,
     ) -> Result<
@@ -60,14 +109,32 @@ impl ssh_agent_lib::agent::Session for SshAgent {
         let pubkey =
             ssh_agent_lib::ssh_key::PublicKey::new(request.pubkey, "");
 
-        let private_key =
-            crate::actions::find_ssh_private_key(self.state.clone(), pubkey)
-                .await
-                .map_err(|e| {
-                    ssh_agent_lib::error::AgentError::Other(e.into())
-                })?;
+        let key_fingerprint =
+            pubkey.fingerprint(ssh_agent_lib::ssh_key::HashAlg::Sha256);
+        let environment = self.state.lock().await.last_environment().clone();
+        let authorization = crate::actions::authorize_ssh_sign(
+            self.state.clone(),
+            &environment,
+            &self.requester,
+            &key_fingerprint.to_string(),
+        )
+        .await
+        .map_err(|e| ssh_agent_lib::error::AgentError::Other(e.into()))?;
 
-        match private_key.key_data() {
+        let private_key = crate::actions::find_ssh_private_key(
+            self.state.clone(),
+            pubkey,
+            &authorization,
+        )
+        .await
+        .map_err(|e| ssh_agent_lib::error::AgentError::Other(e.into()))?;
+
+        let state_guard = self.state.lock().await;
+        state_guard
+            .ensure_lock_generation(authorization.lock_generation())
+            .map_err(|e| ssh_agent_lib::error::AgentError::Other(e.into()))?;
+
+        let result = match private_key.key_data() {
             ssh_agent_lib::ssh_key::private::KeypairData::Ed25519(key) => key
                 .try_sign(&request.data)
                 .map_err(ssh_agent_lib::error::AgentError::other),
@@ -125,6 +192,21 @@ impl ssh_agent_lib::agent::Session for SshAgent {
             other => Err(ssh_agent_lib::error::AgentError::Other(
                 format!("Unsupported key type: {other:?}").into(),
             )),
-        }
+        };
+        drop(state_guard);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_process_names_for_pinentry() {
+        assert_eq!(
+            sanitize_process_name(std::ffi::OsStr::new("ssh\n%0A evil")),
+            "ssh??0A?evil"
+        );
     }
 }

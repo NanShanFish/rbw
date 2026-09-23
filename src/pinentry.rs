@@ -4,6 +4,13 @@ use std::convert::TryFrom as _;
 
 use tokio::io::AsyncWriteExt as _;
 
+fn escape_assuan_arg(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
 pub async fn getpin(
     pinentry: &str,
     prompt: &str,
@@ -13,7 +20,8 @@ pub async fn getpin(
     grab: bool,
 ) -> Result<crate::locked::Password> {
     let mut opts = tokio::process::Command::new(pinentry);
-    opts.stdin(std::process::Stdio::piped())
+    opts.kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     let mut args = vec!["--timeout".into(), "0".into()];
     if let Some(tty) = environment.tty() {
@@ -54,18 +62,24 @@ pub async fn getpin(
         .map_err(|source| Error::WriteStdin { source })?;
     ncommands += 1;
     stdin
-        .write_all(format!("SETPROMPT {prompt}\n").as_bytes())
+        .write_all(
+            format!("SETPROMPT {}\n", escape_assuan_arg(prompt)).as_bytes(),
+        )
         .await
         .map_err(|source| Error::WriteStdin { source })?;
     ncommands += 1;
     stdin
-        .write_all(format!("SETDESC {desc}\n").as_bytes())
+        .write_all(
+            format!("SETDESC {}\n", escape_assuan_arg(desc)).as_bytes(),
+        )
         .await
         .map_err(|source| Error::WriteStdin { source })?;
     ncommands += 1;
     if let Some(err) = err {
         stdin
-            .write_all(format!("SETERROR {err}\n").as_bytes())
+            .write_all(
+                format!("SETERROR {}\n", escape_assuan_arg(err)).as_bytes(),
+            )
             .await
             .map_err(|source| Error::WriteStdin { source })?;
         ncommands += 1;
@@ -209,6 +223,14 @@ fn percent_decode(buf: &mut [u8]) -> usize {
     }
 
     write_idx
+}
+
+#[test]
+fn test_escape_assuan_arg() {
+    assert_eq!(
+        escape_assuan_arg("line 1\nline 2\r100%"),
+        "line 1%0Aline 2%0D100%25"
+    );
 }
 
 #[test]

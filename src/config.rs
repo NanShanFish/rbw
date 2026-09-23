@@ -4,6 +4,23 @@ use std::io::{Read as _, Write as _};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+#[derive(
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SshAgentConfirmation {
+    #[default]
+    Always,
+    Never,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Config {
     pub email: Option<String>,
@@ -18,6 +35,8 @@ pub struct Config {
     pub sync_interval: u64,
     #[serde(default = "default_pinentry")]
     pub pinentry: String,
+    #[serde(default)]
+    pub ssh_agent_confirmation: SshAgentConfirmation,
     pub client_cert_path: Option<std::path::PathBuf>,
     // backcompat, no longer generated in new configs
     #[serde(skip_serializing)]
@@ -36,6 +55,7 @@ impl Default for Config {
             lock_timeout: default_lock_timeout(),
             sync_interval: default_sync_interval(),
             pinentry: default_pinentry(),
+            ssh_agent_confirmation: SshAgentConfirmation::default(),
             client_cert_path: None,
             device_id: None,
         }
@@ -245,5 +265,30 @@ pub async fn device_id(config: &Config) -> Result<String> {
             }
         })?;
         Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_agent_confirmation_defaults_to_always() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            config.ssh_agent_confirmation,
+            SshAgentConfirmation::Always
+        );
+    }
+
+    #[test]
+    fn ssh_agent_confirmation_deserializes_never() {
+        let config: Config =
+            serde_json::from_str(r#"{"ssh_agent_confirmation":"never"}"#)
+                .unwrap();
+        assert_eq!(
+            config.ssh_agent_confirmation,
+            SshAgentConfirmation::Never
+        );
     }
 }

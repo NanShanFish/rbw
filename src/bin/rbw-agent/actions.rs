@@ -371,91 +371,211 @@ async fn login_success(
     Ok(())
 }
 
+const PINENTRY_TRANSACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+pub struct SshAuthorization {
+    keys: Option<rbw::locked::Keys>,
+    org_keys: Option<std::collections::HashMap<String, rbw::locked::Keys>>,
+    lock_generation: u64,
+}
+
+impl SshAuthorization {
+    pub fn lock_generation(&self) -> u64 {
+        self.lock_generation
+    }
+
+    fn key(&self, org_id: Option<&str>) -> Option<&rbw::locked::Keys> {
+        org_id.map_or(self.keys.as_ref(), |id| {
+            self.org_keys.as_ref().and_then(|keys| keys.get(id))
+        })
+    }
+
+    #[cfg(test)]
+    fn unconfirmed(lock_generation: u64) -> Self {
+        Self {
+            keys: None,
+            org_keys: None,
+            lock_generation,
+        }
+    }
+}
+
+async fn with_pinentry_transaction_timeout<T>(
+    timeout: std::time::Duration,
+    authorization: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(timeout, authorization)
+        .await
+        .context("pinentry transaction timed out")?
+}
+
+async fn verify_database_password(
+    environment: &rbw::protocol::Environment,
+    description: &str,
+) -> anyhow::Result<(
+    rbw::locked::Keys,
+    std::collections::HashMap<String, rbw::locked::Keys>,
+)> {
+    let db = load_db().await?;
+
+    let Some(kdf) = db.kdf else {
+        return Err(anyhow::anyhow!("failed to find kdf type in db"));
+    };
+    let Some(iterations) = db.iterations else {
+        return Err(anyhow::anyhow!(
+            "failed to find number of iterations in db"
+        ));
+    };
+    let Some(protected_key) = db.protected_key else {
+        return Err(anyhow::anyhow!("failed to find protected key in db"));
+    };
+    let Some(protected_private_key) = db.protected_private_key else {
+        return Err(anyhow::anyhow!(
+            "failed to find protected private key in db"
+        ));
+    };
+
+    let email = config_email().await?;
+    let pinentry = config_pinentry().await?;
+    let mut err_msg = None;
+    for i in 1_u8..=3 {
+        let err = if i > 1 {
+            Some(format!("{} (attempt {i}/3)", err_msg.take().unwrap()))
+        } else {
+            None
+        };
+        let password = rbw::pinentry::getpin(
+            &pinentry,
+            "Master Password",
+            description,
+            err.as_deref(),
+            environment,
+            true,
+        )
+        .await
+        .context("failed to read password from pinentry")?;
+        match rbw::actions::unlock(
+            &email,
+            &password,
+            kdf,
+            iterations,
+            db.memory,
+            db.parallelism,
+            &protected_key,
+            &protected_private_key,
+            &db.protected_org_keys,
+        ) {
+            Ok(keys) => return Ok(keys),
+            Err(rbw::error::Error::IncorrectPassword { message }) => {
+                if i == 3 {
+                    return Err(rbw::error::Error::IncorrectPassword {
+                        message,
+                    })
+                    .context("failed to unlock database");
+                }
+                err_msg = Some(message);
+            }
+            Err(e) => return Err(e).context("failed to unlock database"),
+        }
+    }
+
+    unreachable!()
+}
+
+async fn unlock_database(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    description: &str,
+) -> anyhow::Result<()> {
+    let lock_generation = state.lock().await.lock_generation();
+    with_pinentry_transaction_timeout(PINENTRY_TRANSACTION_TIMEOUT, async {
+        let pinentry_gate = state.lock().await.pinentry_gate.clone();
+        let _pinentry = pinentry_gate.lock().await;
+        {
+            let state = state.lock().await;
+            state
+                .ensure_lock_generation(lock_generation)
+                .context("unlock invalidated before prompting")?;
+            if !state.needs_unlock() {
+                return Ok(());
+            }
+        }
+
+        let (keys, org_keys) =
+            verify_database_password(environment, description).await?;
+        let mut state = state.lock().await;
+        state
+            .ensure_lock_generation(lock_generation)
+            .context("unlock invalidated")?;
+        state.priv_key = Some(keys);
+        state.org_keys = Some(org_keys);
+        Ok(())
+    })
+    .await
+}
+
 async fn unlock_state(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
-    if state.lock().await.needs_unlock() {
-        let db = load_db().await?;
+    unlock_database(
+        state,
+        environment,
+        &format!("Unlock the local database for '{}'", rbw::dirs::profile()),
+    )
+    .await
+}
 
-        let Some(kdf) = db.kdf else {
-            return Err(anyhow::anyhow!("failed to find kdf type in db"));
-        };
-
-        let Some(iterations) = db.iterations else {
-            return Err(anyhow::anyhow!(
-                "failed to find number of iterations in db"
-            ));
-        };
-
-        let memory = db.memory;
-        let parallelism = db.parallelism;
-
-        let Some(protected_key) = db.protected_key else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected key in db"
-            ));
-        };
-        let Some(protected_private_key) = db.protected_private_key else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected private key in db"
-            ));
-        };
-
-        let email = config_email().await?;
-
-        let mut err_msg = None;
-        for i in 1_u8..=3 {
-            let err = if i > 1 {
-                // this unwrap is safe because we only ever continue the loop
-                // if we have set err_msg
-                Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
-            } else {
-                None
-            };
-            let password = rbw::pinentry::getpin(
-                &config_pinentry().await?,
-                "Master Password",
-                &format!(
-                    "Unlock the local database for '{}'",
-                    rbw::dirs::profile()
-                ),
-                err.as_deref(),
-                environment,
-                true,
-            )
-            .await
-            .context("failed to read password from pinentry")?;
-            match rbw::actions::unlock(
-                &email,
-                &password,
-                kdf,
-                iterations,
-                memory,
-                parallelism,
-                &protected_key,
-                &protected_private_key,
-                &db.protected_org_keys,
-            ) {
-                Ok((keys, org_keys)) => {
-                    unlock_success(state, keys, org_keys).await?;
-                    break;
-                }
-                Err(rbw::error::Error::IncorrectPassword { message }) => {
-                    if i == 3 {
-                        return Err(rbw::error::Error::IncorrectPassword {
-                            message,
-                        })
-                        .context("failed to unlock database");
-                    }
-                    err_msg = Some(message);
-                }
-                Err(e) => return Err(e).context("failed to unlock database"),
-            }
-        }
+pub async fn authorize_ssh_sign(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    requester: &str,
+    key_fingerprint: &str,
+) -> anyhow::Result<SshAuthorization> {
+    let lock_generation = state.lock().await.lock_generation();
+    let config = rbw::config::Config::load_async().await?;
+    if config.ssh_agent_confirmation
+        == rbw::config::SshAgentConfirmation::Never
+    {
+        return Ok(SshAuthorization {
+            keys: None,
+            org_keys: None,
+            lock_generation,
+        });
     }
 
-    Ok(())
+    with_pinentry_transaction_timeout(
+        PINENTRY_TRANSACTION_TIMEOUT,
+        async {
+        let pinentry_gate = state.lock().await.pinentry_gate.clone();
+        let _pinentry = pinentry_gate.lock().await;
+        state
+            .lock()
+            .await
+            .ensure_lock_generation(lock_generation)
+            .context("SSH authorization invalidated before prompting")?;
+        let (keys, org_keys) = verify_database_password(
+            environment,
+            &format!(
+                "SSH signature request\n\nProcess: {requester}\nKey: {key_fingerprint}\n\nEnter your master password to authorize this request."
+            ),
+        )
+        .await?;
+        state
+            .lock()
+            .await
+            .ensure_lock_generation(lock_generation)
+            .context("SSH authorization invalidated")?;
+
+        Ok(SshAuthorization {
+            keys: Some(keys),
+            org_keys: Some(org_keys),
+            lock_generation,
+        })
+    },
+    )
+    .await
 }
 
 pub async fn unlock(
@@ -467,17 +587,6 @@ pub async fn unlock(
 
     respond_ack(sock).await?;
 
-    Ok(())
-}
-
-async fn unlock_success(
-    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
-    keys: rbw::locked::Keys,
-    org_keys: std::collections::HashMap<String, rbw::locked::Keys>,
-) -> anyhow::Result<()> {
-    let mut state = state.lock().await;
-    state.priv_key = Some(keys);
-    state.org_keys = Some(org_keys);
     Ok(())
 }
 
@@ -548,23 +657,11 @@ pub async fn sync(
     Ok(())
 }
 
-async fn decrypt_cipher(
-    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
-    environment: &rbw::protocol::Environment,
+fn decrypt_cipher_with_keys(
+    keys: &rbw::locked::Keys,
     cipherstring: &str,
     entry_key: Option<&str>,
-    org_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let mut state = state.lock().await;
-    if !state.master_password_reprompt_initialized() {
-        let db = load_db().await?;
-        state.set_master_password_reprompt(&db.entries);
-    }
-    let Some(keys) = state.key(org_id) else {
-        return Err(anyhow::anyhow!(
-            "failed to find decryption keys in in-memory state"
-        ));
-    };
     let entry_key = if let Some(entry_key) = entry_key {
         let key_cipherstring =
             rbw::cipherstring::CipherString::new(entry_key)
@@ -577,99 +674,69 @@ async fn decrypt_cipher(
     } else {
         None
     };
-
-    let mut sha256 = sha2::Sha256::new();
-    sha256.update(cipherstring);
-    let master_password_reprompt: [u8; 32] = sha256.finalize().into();
-    if state
-        .master_password_reprompt
-        .contains(&master_password_reprompt)
-    {
-        let db = load_db().await?;
-
-        let Some(kdf) = db.kdf else {
-            return Err(anyhow::anyhow!("failed to find kdf type in db"));
-        };
-
-        let Some(iterations) = db.iterations else {
-            return Err(anyhow::anyhow!(
-                "failed to find number of iterations in db"
-            ));
-        };
-
-        let memory = db.memory;
-        let parallelism = db.parallelism;
-
-        let Some(protected_key) = db.protected_key else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected key in db"
-            ));
-        };
-        let Some(protected_private_key) = db.protected_private_key else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected private key in db"
-            ));
-        };
-
-        let email = config_email().await?;
-
-        let mut err_msg = None;
-        for i in 1_u8..=3 {
-            let err = if i > 1 {
-                // this unwrap is safe because we only ever continue the loop
-                // if we have set err_msg
-                Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
-            } else {
-                None
-            };
-            let password = rbw::pinentry::getpin(
-                &config_pinentry().await?,
-                "Master Password",
-                "Accessing this entry requires the master password",
-                err.as_deref(),
-                environment,
-                true,
-            )
-            .await
-            .context("failed to read password from pinentry")?;
-            match rbw::actions::unlock(
-                &email,
-                &password,
-                kdf,
-                iterations,
-                memory,
-                parallelism,
-                &protected_key,
-                &protected_private_key,
-                &db.protected_org_keys,
-            ) {
-                Ok(_) => {
-                    break;
-                }
-                Err(rbw::error::Error::IncorrectPassword { message }) => {
-                    if i == 3 {
-                        return Err(rbw::error::Error::IncorrectPassword {
-                            message,
-                        })
-                        .context("failed to unlock database");
-                    }
-                    err_msg = Some(message);
-                }
-                Err(e) => return Err(e).context("failed to unlock database"),
-            }
-        }
-    }
-
     let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
         .context("failed to parse encrypted secret")?;
-    let plaintext = String::from_utf8(
+    String::from_utf8(
         cipherstring
             .decrypt_symmetric(keys, entry_key.as_ref())
             .context("failed to decrypt encrypted secret")?,
     )
-    .context("failed to parse decrypted secret")?;
+    .context("failed to parse decrypted secret")
+}
 
-    Ok(plaintext)
+async fn decrypt_cipher(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    cipherstring: &str,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+    skip_master_password_reprompt: bool,
+) -> anyhow::Result<String> {
+    let (requires_reprompt, pinentry_gate, lock_generation) = {
+        let mut state = state.lock().await;
+        if !state.master_password_reprompt_initialized() {
+            let db = load_db().await?;
+            state.set_master_password_reprompt(&db.entries);
+        }
+        let mut sha256 = sha2::Sha256::new();
+        sha256.update(cipherstring);
+        let reprompt_hash: [u8; 32] = sha256.finalize().into();
+        (
+            !skip_master_password_reprompt
+                && state.master_password_reprompt.contains(&reprompt_hash),
+            state.pinentry_gate.clone(),
+            state.lock_generation(),
+        )
+    };
+
+    if requires_reprompt {
+        with_pinentry_transaction_timeout(
+            PINENTRY_TRANSACTION_TIMEOUT,
+            async {
+                let _pinentry = pinentry_gate.lock().await;
+                state
+                    .lock()
+                    .await
+                    .ensure_lock_generation(lock_generation)
+                    .context("entry access invalidated before prompting")?;
+                verify_database_password(
+                    environment,
+                    "Accessing this entry requires the master password",
+                )
+                .await
+            },
+        )
+        .await?;
+    }
+
+    let state = state.lock().await;
+    state
+        .ensure_lock_generation(lock_generation)
+        .context("entry access invalidated")?;
+    let keys = state.key(org_id).ok_or_else(|| {
+        anyhow::anyhow!("failed to find decryption keys in in-memory state")
+    })?;
+    decrypt_cipher_with_keys(keys, cipherstring, entry_key)
 }
 
 pub async fn decrypt(
@@ -680,9 +747,15 @@ pub async fn decrypt(
     entry_key: Option<&str>,
     org_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let plaintext =
-        decrypt_cipher(state, environment, cipherstring, entry_key, org_id)
-            .await?;
+    let plaintext = decrypt_cipher(
+        state,
+        environment,
+        cipherstring,
+        entry_key,
+        org_id,
+        false,
+    )
+    .await?;
     respond_decrypt(sock, plaintext).await?;
 
     Ok(())
@@ -899,6 +972,7 @@ pub async fn get_ssh_public_keys(
                 encrypted,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),
+                false,
             )
             .await?;
 
@@ -909,19 +983,41 @@ pub async fn get_ssh_public_keys(
     Ok(pubkeys)
 }
 
+async fn decrypt_ssh_cipher(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    authorization: &SshAuthorization,
+    cipherstring: &str,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(keys) = authorization.key(org_id) {
+        decrypt_cipher_with_keys(keys, cipherstring, entry_key)
+    } else {
+        decrypt_cipher(
+            state,
+            environment,
+            cipherstring,
+            entry_key,
+            org_id,
+            false,
+        )
+        .await
+    }
+}
+
 pub async fn find_ssh_private_key(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     request_public_key: ssh_agent_lib::ssh_key::PublicKey,
+    authorization: &SshAuthorization,
 ) -> anyhow::Result<ssh_agent_lib::ssh_key::PrivateKey> {
-    let environment = {
-        let state = state.lock().await;
-        state.set_timeout();
-        state.last_environment().clone()
-    };
-    unlock_state(state.clone(), &environment).await?;
+    let environment = state.lock().await.last_environment().clone();
+    if authorization.keys.is_none() {
+        state.lock().await.set_timeout();
+        unlock_state(state.clone(), &environment).await?;
+    }
 
     let request_bytes = request_public_key.to_bytes();
-
     let db = load_db().await?;
 
     for entry in db.entries {
@@ -934,9 +1030,10 @@ pub async fn find_ssh_private_key(
             let Some(public_key_enc) = public_key else {
                 continue;
             };
-            let public_key_plaintext = decrypt_cipher(
+            let public_key_plaintext = decrypt_ssh_cipher(
                 state.clone(),
                 &environment,
+                authorization,
                 public_key_enc,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),
@@ -955,9 +1052,10 @@ pub async fn find_ssh_private_key(
                         anyhow::anyhow!("Matching entry has no private key")
                     })?;
 
-                let private_key_plaintext = decrypt_cipher(
+                let private_key_plaintext = decrypt_ssh_cipher(
                     state.clone(),
                     &environment,
+                    authorization,
                     private_key_enc,
                     entry.key.as_deref(),
                     entry.org_id.as_deref(),
@@ -1025,5 +1123,55 @@ mod tests {
             .decrypt_symmetric(&master, None)
             .unwrap();
         assert_eq!(plain, b"secret");
+    }
+
+    #[test]
+    fn unconfirmed_ssh_authorization_has_no_decryption_keys() {
+        let authorization = SshAuthorization::unconfirmed(7);
+        assert!(authorization.key(None).is_none());
+        assert_eq!(authorization.lock_generation(), 7);
+    }
+
+    #[tokio::test]
+    async fn pinentry_timeout_covers_the_entire_future() {
+        let result = with_pinentry_transaction_timeout(
+            std::time::Duration::from_millis(10),
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("pinentry transaction timed out"));
+    }
+
+    #[test]
+    fn confirmed_ssh_authorization_uses_temporary_keys() {
+        let authorization = SshAuthorization {
+            keys: Some(test_keys(4)),
+            org_keys: Some(std::collections::HashMap::new()),
+            lock_generation: 9,
+        };
+        let ciphertext = encrypt_with_key(
+            authorization.key(None).unwrap(),
+            None,
+            "private key",
+        )
+        .unwrap();
+
+        assert_eq!(
+            decrypt_cipher_with_keys(
+                authorization.key(None).unwrap(),
+                &ciphertext,
+                None,
+            )
+            .unwrap(),
+            "private key"
+        );
+        assert_eq!(authorization.lock_generation(), 9);
     }
 }

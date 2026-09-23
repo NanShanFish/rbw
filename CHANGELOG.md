@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+## Added
+
+* SSH agent signature requests now require the master password through
+  pinentry by default. The prompt identifies the direct requesting process
+  and key fingerprint. Set `ssh_agent_confirmation` to `never` to disable
+  this additional per-signature confirmation; database unlock and item-level
+  master password prompts still apply. Abandoned signature confirmations time
+  out after two minutes.
+
 ## [1.15.0] - 2025-12-31
 
 ## Added

@@ -105,6 +105,11 @@ configuration options:
 * `pinentry`: The
   [pinentry](https://www.gnupg.org/related_software/pinentry/index.html)
   executable to use. Defaults to `pinentry`.
+* `ssh_agent_confirmation`: Controls authorization for SSH agent signatures.
+  Defaults to `always`, which requires the master password through pinentry for
+  every signature request. Set it to `never` to disable this additional
+  per-signature confirmation. Initial database unlocks and item-level master
+  password re-prompts still apply in both modes.
 
 ### Profiles
 
@@ -160,7 +165,28 @@ export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/rbw/ssh-agent-socket"
 ```
 
 If you're using a profile, the socket will be located at
-`"XDG_RUNTIME_DIR/rbw-<profile>/ssh-agent-socket"`.
+`"$XDG_RUNTIME_DIR/rbw-<profile>/ssh-agent-socket"`.
+
+If `ssh_agent_confirmation` is `always` (the default), every signature
+request opens pinentry and shows the direct process connected to the agent,
+its PID when available, and the requested key fingerprint. SSH authorization,
+database unlocks, and item-level re-prompts share one pinentry gate. A pinentry
+transaction, including time spent waiting for that gate, is limited to two
+minutes; timeout stops the pinentry child process and releases the gate. To
+disable this additional confirmation:
+
+```sh
+rbw config set ssh_agent_confirmation never
+```
+
+This does not disable the initial database unlock prompt or item-level master
+password re-prompts. Listing identities with `ssh-add -L` does not trigger the
+additional per-signature confirmation, but it still prompts to unlock a locked
+database.
+
+The process shown is the direct Unix socket peer. For example, when OpenSSH
+is used it will normally be `ssh`, not the application that started `ssh`.
+
 
 ### 2FA support
 

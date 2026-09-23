@@ -41,6 +41,8 @@ async fn tokio_main(
             notifications_handler,
             master_password_reprompt: std::collections::HashSet::new(),
             master_password_reprompt_initialized: false,
+            pinentry_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            lock_generation: 0,
             last_environment: rbw::protocol::Environment::default(),
             #[cfg(feature = "clipboard")]
             clipboard: arboard::Clipboard::new()
