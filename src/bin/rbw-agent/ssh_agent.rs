@@ -6,13 +6,21 @@ const SSH_AGENT_RSA_SHA2_512: u32 = 4;
 #[derive(Clone)]
 pub struct SshAgent {
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    pinentry: Option<String>,
+    environment: rbw::protocol::Environment,
 }
 
 impl SshAgent {
     pub fn new(
         state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+        pinentry: Option<String>,
+        environment: rbw::protocol::Environment,
     ) -> Self {
-        Self { state }
+        Self {
+            state,
+            pinentry,
+            environment,
+        }
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -31,6 +39,8 @@ impl SshAgent {
 struct SshAgentSession {
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     requester: String,
+    pinentry: Option<String>,
+    environment: rbw::protocol::Environment,
 }
 
 fn sanitize_process_name(name: &std::ffi::OsStr) -> String {
@@ -72,6 +82,8 @@ impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for SshAgent {
         SshAgentSession {
             state: self.state.clone(),
             requester: requester_name(socket),
+            pinentry: self.pinentry.clone(),
+            environment: self.environment.clone(),
         }
     }
 }
@@ -84,19 +96,23 @@ impl ssh_agent_lib::agent::Session for SshAgentSession {
         Vec<ssh_agent_lib::proto::Identity>,
         ssh_agent_lib::error::AgentError,
     > {
-        crate::actions::get_ssh_public_keys(self.state.clone())
-            .await
-            .map_err(|e| ssh_agent_lib::error::AgentError::Other(e.into()))?
-            .into_iter()
-            .map(|p| {
-                p.parse::<ssh_agent_lib::ssh_key::PublicKey>()
-                    .map(|pk| ssh_agent_lib::proto::Identity {
-                        pubkey: pk.key_data().clone(),
-                        comment: String::new(),
-                    })
-                    .map_err(ssh_agent_lib::error::AgentError::other)
-            })
-            .collect()
+        crate::actions::get_ssh_public_keys(
+            self.state.clone(),
+            self.pinentry.as_deref(),
+            &self.environment,
+        )
+        .await
+        .map_err(|e| ssh_agent_lib::error::AgentError::Other(e.into()))?
+        .into_iter()
+        .map(|p| {
+            p.parse::<ssh_agent_lib::ssh_key::PublicKey>()
+                .map(|pk| ssh_agent_lib::proto::Identity {
+                    pubkey: pk.key_data().clone(),
+                    comment: String::new(),
+                })
+                .map_err(ssh_agent_lib::error::AgentError::other)
+        })
+        .collect()
     }
 
     async fn sign(
@@ -111,10 +127,10 @@ impl ssh_agent_lib::agent::Session for SshAgentSession {
 
         let key_fingerprint =
             pubkey.fingerprint(ssh_agent_lib::ssh_key::HashAlg::Sha256);
-        let environment = self.state.lock().await.last_environment().clone();
         let authorization = crate::actions::authorize_ssh_sign(
             self.state.clone(),
-            &environment,
+            self.pinentry.as_deref(),
+            &self.environment,
             &self.requester,
             &key_fingerprint.to_string(),
         )
@@ -125,6 +141,8 @@ impl ssh_agent_lib::agent::Session for SshAgentSession {
             self.state.clone(),
             pubkey,
             &authorization,
+            self.pinentry.as_deref(),
+            &self.environment,
         )
         .await
         .map_err(|e| ssh_agent_lib::error::AgentError::Other(e.into()))?;

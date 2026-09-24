@@ -13,6 +13,16 @@
 * Cache normalized SSH public keys after unlock so identity enumeration does
   not require unlocking the Vault. The per-profile, per-account cache contains
   no private keys or entry metadata and is removed by `rbw purge`.
+* Add `ssh_agent_pinentry` for a dedicated SSH-agent GUI pinentry. When
+  per-signature confirmation is enabled, rbw-agent validates the configured
+  executable or auto-discovers a usable GUI implementation at startup and
+  refuses terminal-only fallbacks.
+
+## Fixed
+
+* SSH-agent password prompts no longer reuse a previously active terminal,
+  where pinentry could compete with the foreground program for input. Windows
+  pinentry CRLF responses are now parsed correctly.
 
 ## [1.15.0] - 2025-12-31
 

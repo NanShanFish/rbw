@@ -106,10 +106,15 @@ configuration options:
   [pinentry](https://www.gnupg.org/related_software/pinentry/index.html)
   executable to use. Defaults to `pinentry`.
 * `ssh_agent_confirmation`: Controls authorization for SSH agent signatures.
-  Defaults to `always`, which requires the master password through pinentry for
-  every signature request. Set it to `never` to disable this additional
-  per-signature confirmation. Initial database unlocks and item-level master
-  password re-prompts still apply in both modes.
+  Defaults to `always`, which requires the master password through a dedicated
+  GUI pinentry for every signature request. Set it to `never` to disable this
+  additional per-signature confirmation.
+* `ssh_agent_pinentry`: Optional path or command name for the GUI pinentry used
+  only by SSH-agent requests. The agent probes an explicitly configured program
+  at startup and rejects terminal-only implementations. With
+  `ssh_agent_confirmation=always`, an unset value makes the agent search `PATH`
+  for a supported GUI pinentry and refuse to start if none is usable. The
+  ordinary `pinentry` setting remains in effect for normal rbw commands.
 
 ### Profiles
 
@@ -180,22 +185,44 @@ previous identity list until the next unlock. A removed key can therefore be
 offered once, but signing still checks the current encrypted Vault and fails
 closed. New keys appear after the next unlock.
 
-If `ssh_agent_confirmation` is `always` (the default), every signature
-request opens pinentry and shows the direct process connected to the agent,
-its PID when available, and the requested key fingerprint. SSH authorization,
-database unlocks, and item-level re-prompts share one pinentry gate. A pinentry
-transaction, including time spent waiting for that gate, is limited to two
-minutes; timeout stops the pinentry child process and releases the gate. To
-disable this additional confirmation:
+If `ssh_agent_confirmation` is `always` (the default), the agent requires a
+usable GUI pinentry at startup. Set an explicit executable, for example:
+
+```sh
+rbw config set ssh_agent_pinentry /usr/bin/pinentry-gnome3
+```
+
+On WSL, a Windows pinentry executable can be configured directly, for example:
+
+```sh
+rbw config set ssh_agent_pinentry /mnt/c/path/to/pinentry.exe
+```
+
+If no executable is configured, the agent searches `PATH` for known GUI
+pinentry implementations. It validates the selected program with a bounded,
+non-interactive Assuan handshake and refuses to start when the program is
+missing, broken, or terminal-only. SSH-agent requests never fall back to the
+TTY used to start rbw-agent or to a terminal pinentry; this prevents pinentry
+from competing with a foreground terminal program for password input.
+
+Every signature request opens the GUI pinentry and shows the direct process
+connected to the agent, its PID when available, and the requested key
+fingerprint. SSH authorization, database unlocks, and item-level re-prompts
+share one pinentry gate. A pinentry transaction, including time spent waiting
+for that gate, is limited to two minutes; timeout stops the pinentry child
+process and releases the gate. To disable this additional confirmation:
 
 ```sh
 rbw config set ssh_agent_confirmation never
 ```
 
-This does not disable the initial database unlock prompt or item-level master
-password re-prompts. Listing identities with `ssh-add -L` never triggers the
-additional per-signature confirmation. Once the public-key cache exists, it
-also does not need to unlock the database.
+This does not bypass database locking or item-level master-password re-prompts.
+When confirmation is `never` and `ssh_agent_pinentry` is unset, an SSH request
+that needs a locked Vault fails closed instead of opening a terminal pinentry;
+run `rbw unlock` explicitly first. An SSH Key with master-password re-prompt
+requires `ssh_agent_pinentry` even in `never` mode. Listing identities with
+`ssh-add -L` never triggers the additional per-signature confirmation. Once
+the public-key cache exists, it also does not need to unlock the database.
 
 The process shown is the direct Unix socket peer. For example, when OpenSSH
 is used it will normally be `ssh`, not the application that started `ssh`.

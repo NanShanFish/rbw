@@ -1,8 +1,12 @@
 use crate::prelude::*;
 
+use anyhow::Context as _;
+
 use std::io::{Read as _, Write as _};
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _,
+};
 
 #[derive(
     serde::Serialize,
@@ -37,6 +41,8 @@ pub struct Config {
     pub pinentry: String,
     #[serde(default)]
     pub ssh_agent_confirmation: SshAgentConfirmation,
+    #[serde(default)]
+    pub ssh_agent_pinentry: Option<String>,
     pub client_cert_path: Option<std::path::PathBuf>,
     // backcompat, no longer generated in new configs
     #[serde(skip_serializing)]
@@ -56,6 +62,7 @@ impl Default for Config {
             sync_interval: default_sync_interval(),
             pinentry: default_pinentry(),
             ssh_agent_confirmation: SshAgentConfirmation::default(),
+            ssh_agent_pinentry: None,
             client_cert_path: None,
             device_id: None,
         }
@@ -72,6 +79,110 @@ pub fn default_sync_interval() -> u64 {
 
 pub fn default_pinentry() -> String {
     "pinentry".to_string()
+}
+
+const SSH_AGENT_PINENTRY_CANDIDATES: &[&str] = &[
+    "pinentry-gnome3",
+    "pinentry-qt",
+    "pinentry-qt5",
+    "pinentry-gui",
+    "pinentry-gtk",
+    "pinentry-w32",
+    "pinentry-gtk-2",
+    "pinentry-mac",
+    "pinentry-fltk",
+];
+const GUI_PINENTRY_MARKERS: &[&str] =
+    &["gnome", "gtk", "qt", "w32", "mac", "fltk", "efl"];
+
+async fn probe_gui_pinentry(pinentry: &str) -> anyhow::Result<()> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new(pinentry)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("pinentry version check timed out")?
+    .with_context(|| format!("failed to start pinentry '{pinentry}'"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "pinentry version check failed: {}",
+            error.trim()
+        ));
+    }
+    let version = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    if !GUI_PINENTRY_MARKERS
+        .iter()
+        .any(|marker| version.contains(marker))
+    {
+        return Err(anyhow::anyhow!(
+            "pinentry did not identify itself as a GUI implementation"
+        ));
+    }
+
+    let mut child = tokio::process::Command::new(pinentry)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start pinentry '{pinentry}'"))?;
+    let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stdout.read_line(&mut line),
+    )
+    .await
+    .context("pinentry greeting timed out")??;
+    if bytes == 0 || !line.trim_end_matches(['\r', '\n']).starts_with("OK") {
+        return Err(anyhow::anyhow!(
+            "pinentry did not return an Assuan greeting"
+        ));
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"BYE\n").await?;
+    drop(stdin);
+    let status =
+        tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .context("pinentry shutdown timed out")??;
+    if !status.success() {
+        return Err(anyhow::anyhow!("pinentry exited with {status}"));
+    }
+    Ok(())
+}
+
+pub async fn resolve_ssh_agent_pinentry(
+    config: &Config,
+) -> anyhow::Result<Option<String>> {
+    if let Some(pinentry) = &config.ssh_agent_pinentry {
+        probe_gui_pinentry(pinentry).await.map_err(|e| {
+            anyhow::anyhow!(
+                "configured ssh_agent_pinentry '{pinentry}' is unusable: {e:#}"
+            )
+        })?;
+        return Ok(Some(pinentry.clone()));
+    }
+    if config.ssh_agent_confirmation == SshAgentConfirmation::Never {
+        return Ok(None);
+    }
+
+    let mut errors = Vec::new();
+    for candidate in SSH_AGENT_PINENTRY_CANDIDATES {
+        match probe_gui_pinentry(candidate).await {
+            Ok(()) => return Ok(Some((*candidate).to_string())),
+            Err(e) => errors.push(format!("{candidate}: {e}")),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "ssh_agent_confirmation=always requires a usable GUI pinentry; configure ssh_agent_pinentry or install one of {}\n{}",
+        SSH_AGENT_PINENTRY_CANDIDATES.join(", "),
+        errors.join("\n")
+    ))
 }
 
 impl Config {
@@ -290,5 +401,65 @@ mod tests {
             config.ssh_agent_confirmation,
             SshAgentConfirmation::Never
         );
+        assert_eq!(config.ssh_agent_pinentry, None);
+    }
+
+    fn fake_pinentry(version: &str) -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pinentry-test");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  echo '{version}'\n  exit 0\nfi\nprintf 'OK hello\\r\\n'\nwhile IFS= read -r line; do\n  if [ \"$line\" = BYE ]; then\n    printf 'OK closing\\r\\n'\n    exit 0\n  fi\ndone\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    #[tokio::test]
+    async fn explicit_gui_pinentry_is_probed() {
+        let (_dir, path) = fake_pinentry("pinentry-w32 (pinentry) test");
+        let config = Config {
+            ssh_agent_pinentry: Some(path.clone()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_ssh_agent_pinentry(&config).await.unwrap(),
+            Some(path)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_pinentry_is_rejected() {
+        let (_dir, path) = fake_pinentry("pinentry-curses (pinentry) test");
+        let config = Config {
+            ssh_agent_pinentry: Some(path),
+            ..Config::default()
+        };
+
+        let error = resolve_ssh_agent_pinentry(&config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not identify itself as a GUI"));
+    }
+
+    #[tokio::test]
+    async fn never_without_pinentry_does_not_require_gui() {
+        let config = Config {
+            ssh_agent_confirmation: SshAgentConfirmation::Never,
+            ..Config::default()
+        };
+
+        assert_eq!(resolve_ssh_agent_pinentry(&config).await.unwrap(), None);
     }
 }

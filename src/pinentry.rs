@@ -26,6 +26,8 @@ pub async fn getpin(
     let mut args = vec!["--timeout".into(), "0".into()];
     if let Some(tty) = environment.tty() {
         args.extend(["--ttyname".into(), tty.into()]);
+    } else {
+        opts.env_remove("GPG_TTY").env_remove("TTY");
     }
 
     let env_vars = environment.env_vars();
@@ -123,6 +125,8 @@ where
     loop {
         let nl = data.iter().take(len).position(|c| *c == b'\n');
         if let Some(nl) = nl {
+            let line_end = nl
+                .saturating_sub(usize::from(nl > 0 && data[nl - 1] == b'\r'));
             if data.starts_with(b"OK") {
                 if ncommands == 1 {
                     len = 0;
@@ -132,14 +136,15 @@ where
                 len -= nl + 1;
                 ncommands -= 1;
             } else if data.starts_with(b"D ") {
-                data.copy_within(2..nl, 0);
-                len = nl - 2;
+                data.copy_within(2..line_end, 0);
+                len = line_end - 2;
                 break;
             } else if data.starts_with(b"S ") {
                 data.copy_within((nl + 1).., 0);
                 len -= nl + 1;
             } else if data.starts_with(b"ERR ") {
-                let line: Vec<u8> = data.iter().take(nl).copied().collect();
+                let line: Vec<u8> =
+                    data.iter().take(line_end).copied().collect();
                 let line = String::from_utf8(line).unwrap();
                 let mut split = line.splitn(3, ' ');
                 let _ = split.next(); // ERR
@@ -236,8 +241,8 @@ fn test_escape_assuan_arg() {
 #[test]
 fn test_read_password() {
     let good_inputs = &[
-        (0, &b"D super secret password\n"[..]),
-        (4, &b"OK\nOK\nOK\nD super secret password\nOK\n"[..]),
+        (0, &b"D super secret password\r\n"[..]),
+        (4, &b"OK\r\nOK\r\nOK\r\nD super secret password\r\nOK\r\n"[..]),
         (12, &b"OK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nD super secret password\nOK\n"[..]),
         (24, &b"OK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nOK\nD super secret password\nOK\n"[..]),
     ];

@@ -153,6 +153,15 @@ impl Environment {
         self.tty.as_ref().map(|tty| tty.0.as_os_str())
     }
 
+    #[must_use]
+    pub fn without_tty(mut self) -> Self {
+        self.tty = None;
+        self.env_vars.retain(|(name, _)| {
+            !matches!(name.0.to_str(), Some("GPG_TTY" | "TTY"))
+        });
+        self
+    }
+
     pub fn env_vars(
         &self,
     ) -> std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>
@@ -162,6 +171,38 @@ impl Environment {
             .map(|(var, val)| (var.0.clone(), val.0.clone()))
             .filter(|(var, _)| (*ENVIRONMENT_VARIABLES_OS).contains(var))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_tty_preserves_gui_environment_only() {
+        let environment = Environment::new(
+            Some("/dev/pts/7".into()),
+            vec![
+                ("DISPLAY".into(), ":0".into()),
+                ("WAYLAND_DISPLAY".into(), "wayland-0".into()),
+                ("GPG_TTY".into(), "/dev/pts/7".into()),
+                ("TTY".into(), "/dev/pts/7".into()),
+            ],
+        )
+        .without_tty();
+
+        assert_eq!(environment.tty(), None);
+        let vars = environment.env_vars();
+        assert_eq!(
+            vars.get(std::ffi::OsStr::new("DISPLAY")),
+            Some(&std::ffi::OsString::from(":0"))
+        );
+        assert_eq!(
+            vars.get(std::ffi::OsStr::new("WAYLAND_DISPLAY")),
+            Some(&std::ffi::OsString::from("wayland-0"))
+        );
+        assert!(!vars.contains_key(std::ffi::OsStr::new("GPG_TTY")));
+        assert!(!vars.contains_key(std::ffi::OsStr::new("TTY")));
     }
 }
 

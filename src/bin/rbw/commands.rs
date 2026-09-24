@@ -1280,6 +1280,9 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
                 }
             };
         }
+        "ssh_agent_pinentry" => {
+            config.ssh_agent_pinentry = Some(value.to_string());
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1313,6 +1316,7 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
             config.ssh_agent_confirmation =
                 rbw::config::SshAgentConfirmation::default();
         }
+        "ssh_agent_pinentry" => config.ssh_agent_pinentry = None,
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;

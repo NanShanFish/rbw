@@ -14,18 +14,6 @@ pub struct State {
     pub pinentry_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
     pub lock_generation: u64,
 
-    // this is stored here specifically for the use of the ssh agent, because
-    // requests made to the ssh agent don't include an environment, and so we
-    // can't properly initialize the pinentry process. we work around this by
-    // just reusing the last environment we saw being sent to the main agent
-    // (there should be at least one in most cases because you need to start
-    // the rbw agent in order to make it start serving on the ssh agent
-    // socket, and that initial request should come with an environment).
-    //
-    // we should not use this for any requests on the main agent, those
-    // should all send their own environment over.
-    pub last_environment: rbw::protocol::Environment,
-
     #[cfg(feature = "clipboard")]
     pub clipboard: Option<arboard::Clipboard>,
 }
@@ -152,17 +140,6 @@ impl State {
     pub fn master_password_reprompt_initialized(&self) -> bool {
         self.master_password_reprompt_initialized
     }
-
-    pub fn last_environment(&self) -> &rbw::protocol::Environment {
-        &self.last_environment
-    }
-
-    pub fn set_last_environment(
-        &mut self,
-        environment: rbw::protocol::Environment,
-    ) {
-        self.last_environment = environment;
-    }
 }
 
 #[cfg(test)]
@@ -185,7 +162,6 @@ mod tests {
             master_password_reprompt_initialized: false,
             pinentry_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             lock_generation: 0,
-            last_environment: rbw::protocol::Environment::default(),
             #[cfg(feature = "clipboard")]
             clipboard: None,
         }

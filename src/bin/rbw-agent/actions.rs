@@ -415,6 +415,7 @@ async fn with_pinentry_transaction_timeout<T>(
 }
 
 async fn verify_database_password(
+    pinentry: &str,
     environment: &rbw::protocol::Environment,
     description: &str,
 ) -> anyhow::Result<(
@@ -441,7 +442,6 @@ async fn verify_database_password(
     };
 
     let email = config_email().await?;
-    let pinentry = config_pinentry().await?;
     let mut err_msg = None;
     for i in 1_u8..=3 {
         let err = if i > 1 {
@@ -450,7 +450,7 @@ async fn verify_database_password(
             None
         };
         let password = rbw::pinentry::getpin(
-            &pinentry,
+            pinentry,
             "Master Password",
             description,
             err.as_deref(),
@@ -487,8 +487,9 @@ async fn verify_database_password(
     unreachable!()
 }
 
-async fn unlock_database(
+async fn unlock_database_with_pinentry(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    pinentry: &str,
     environment: &rbw::protocol::Environment,
     description: &str,
 ) -> anyhow::Result<()> {
@@ -507,7 +508,8 @@ async fn unlock_database(
         }
 
         let (keys, org_keys) =
-            verify_database_password(environment, description).await?;
+            verify_database_password(pinentry, environment, description)
+                .await?;
         let mut state = state.lock().await;
         state
             .ensure_lock_generation(lock_generation)
@@ -517,6 +519,16 @@ async fn unlock_database(
         Ok(())
     })
     .await
+}
+
+async fn unlock_database(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    description: &str,
+) -> anyhow::Result<()> {
+    let pinentry = config_pinentry().await?;
+    unlock_database_with_pinentry(state, &pinentry, environment, description)
+        .await
 }
 
 async fn unlock_state(
@@ -533,6 +545,7 @@ async fn unlock_state(
 
 pub async fn authorize_ssh_sign(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    pinentry: Option<&str>,
     environment: &rbw::protocol::Environment,
     requester: &str,
     key_fingerprint: &str,
@@ -549,35 +562,41 @@ pub async fn authorize_ssh_sign(
         });
     }
 
+    let pinentry = pinentry.ok_or_else(|| {
+        anyhow::anyhow!(
+            "SSH signature confirmation requires a configured GUI pinentry"
+        )
+    })?;
     with_pinentry_transaction_timeout(
         PINENTRY_TRANSACTION_TIMEOUT,
         async {
-        let pinentry_gate = state.lock().await.pinentry_gate.clone();
-        let _pinentry = pinentry_gate.lock().await;
-        state
-            .lock()
-            .await
-            .ensure_lock_generation(lock_generation)
-            .context("SSH authorization invalidated before prompting")?;
-        let (keys, org_keys) = verify_database_password(
-            environment,
-            &format!(
-                "SSH signature request\n\nProcess: {requester}\nKey: {key_fingerprint}\n\nEnter your master password to authorize this request."
-            ),
-        )
-        .await?;
-        state
-            .lock()
-            .await
-            .ensure_lock_generation(lock_generation)
-            .context("SSH authorization invalidated")?;
+            let pinentry_gate = state.lock().await.pinentry_gate.clone();
+            let _pinentry = pinentry_gate.lock().await;
+            state
+                .lock()
+                .await
+                .ensure_lock_generation(lock_generation)
+                .context("SSH authorization invalidated before prompting")?;
+            let (keys, org_keys) = verify_database_password(
+                pinentry,
+                environment,
+                &format!(
+                    "SSH signature request\\n\\nProcess: {requester}\\nKey: {key_fingerprint}\\n\\nEnter your master password to authorize this request."
+                ),
+            )
+            .await?;
+            state
+                .lock()
+                .await
+                .ensure_lock_generation(lock_generation)
+                .context("SSH authorization invalidated")?;
 
-        Ok(SshAuthorization {
-            keys: Some(keys),
-            org_keys: Some(org_keys),
-            lock_generation,
-        })
-    },
+            Ok(SshAuthorization {
+                keys: Some(keys),
+                org_keys: Some(org_keys),
+                lock_generation,
+            })
+        },
     )
     .await
 }
@@ -712,6 +731,7 @@ async fn decrypt_cipher(
     entry_key: Option<&str>,
     org_id: Option<&str>,
     skip_master_password_reprompt: bool,
+    pinentry: Option<&str>,
 ) -> anyhow::Result<String> {
     let (requires_reprompt, pinentry_gate, lock_generation) = {
         let mut state = state.lock().await;
@@ -740,7 +760,13 @@ async fn decrypt_cipher(
                     .await
                     .ensure_lock_generation(lock_generation)
                     .context("entry access invalidated before prompting")?;
+                let pinentry = pinentry.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "SSH key requires a master-password re-prompt; configure ssh_agent_pinentry"
+                    )
+                })?;
                 verify_database_password(
+                    pinentry,
                     environment,
                     "Accessing this entry requires the master password",
                 )
@@ -768,6 +794,7 @@ pub async fn decrypt(
     entry_key: Option<&str>,
     org_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    let pinentry = config_pinentry().await?;
     let plaintext = decrypt_cipher(
         state,
         environment,
@@ -775,6 +802,7 @@ pub async fn decrypt(
         entry_key,
         org_id,
         false,
+        Some(&pinentry),
     )
     .await?;
     respond_decrypt(sock, plaintext).await?;
@@ -1063,6 +1091,8 @@ async fn refresh_ssh_public_key_cache(
 
 pub async fn get_ssh_public_keys(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    pinentry: Option<&str>,
+    environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<Vec<String>> {
     match load_ssh_public_key_cache().await {
         Ok(Some(public_keys)) => return Ok(public_keys),
@@ -1079,12 +1109,19 @@ pub async fn get_ssh_public_keys(
         }
     }
 
-    let environment = {
-        let state = state.lock().await;
-        state.set_timeout();
-        state.last_environment().clone()
-    };
-    unlock_state(state.clone(), &environment).await?;
+    let pinentry = pinentry.ok_or_else(|| {
+        anyhow::anyhow!(
+            "SSH public-key cache is missing; run `rbw unlock` or configure ssh_agent_pinentry"
+        )
+    })?;
+    state.lock().await.set_timeout();
+    unlock_database_with_pinentry(
+        state.clone(),
+        pinentry,
+        environment,
+        &format!("Unlock the local database for '{}'", rbw::dirs::profile()),
+    )
+    .await?;
     refresh_ssh_public_key_cache(state).await
 }
 
@@ -1092,6 +1129,7 @@ async fn decrypt_ssh_cipher(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
     authorization: &SshAuthorization,
+    pinentry: Option<&str>,
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
@@ -1106,6 +1144,7 @@ async fn decrypt_ssh_cipher(
             entry_key,
             org_id,
             false,
+            pinentry,
         )
         .await
     }
@@ -1115,11 +1154,26 @@ pub async fn find_ssh_private_key(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     request_public_key: ssh_agent_lib::ssh_key::PublicKey,
     authorization: &SshAuthorization,
+    pinentry: Option<&str>,
+    environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<ssh_agent_lib::ssh_key::PrivateKey> {
-    let environment = state.lock().await.last_environment().clone();
-    if authorization.keys.is_none() {
+    if authorization.keys.is_none() && state.lock().await.needs_unlock() {
+        let pinentry = pinentry.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Vault is locked; run `rbw unlock` or configure ssh_agent_pinentry"
+            )
+        })?;
         state.lock().await.set_timeout();
-        unlock_state(state.clone(), &environment).await?;
+        unlock_database_with_pinentry(
+            state.clone(),
+            pinentry,
+            environment,
+            &format!(
+                "Unlock the local database for '{}'",
+                rbw::dirs::profile()
+            ),
+        )
+        .await?;
     }
 
     let request_bytes = request_public_key.to_bytes();
@@ -1137,8 +1191,9 @@ pub async fn find_ssh_private_key(
             };
             let public_key_plaintext = decrypt_ssh_cipher(
                 state.clone(),
-                &environment,
+                environment,
                 authorization,
+                pinentry,
                 public_key_enc,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),
@@ -1159,8 +1214,9 @@ pub async fn find_ssh_private_key(
 
                 let private_key_plaintext = decrypt_ssh_cipher(
                     state.clone(),
-                    &environment,
+                    environment,
                     authorization,
+                    pinentry,
                     private_key_enc,
                     entry.key.as_deref(),
                     entry.org_id.as_deref(),
