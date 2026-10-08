@@ -395,7 +395,6 @@ impl SshAuthorization {
         })
     }
 
-    #[cfg(test)]
     fn unconfirmed(lock_generation: u64) -> Self {
         Self {
             keys: None,
@@ -548,7 +547,7 @@ fn ssh_signature_description(
     key_fingerprint: &str,
 ) -> String {
     format!(
-        "SSH signature request\n\nProcess: {requester}\nKey: {key_fingerprint}\n\nEnter your master password to authorize this request."
+        "SSH signature request\n\nProcess: {requester}\nKey: {key_fingerprint}\n\nAllow this signature request?"
     )
 }
 
@@ -584,23 +583,18 @@ pub async fn authorize_ssh_sign(
             .await
             .ensure_lock_generation(lock_generation)
             .context("SSH authorization invalidated before prompting")?;
-        let (keys, org_keys) = verify_database_password(
-            pinentry,
-            environment,
-            &ssh_signature_description(requester, key_fingerprint),
-        )
-        .await?;
+        let description =
+            ssh_signature_description(requester, key_fingerprint);
+        rbw::pinentry::confirm(pinentry, &description, environment)
+            .await
+            .context("SSH signature confirmation failed")?;
         state
             .lock()
             .await
             .ensure_lock_generation(lock_generation)
             .context("SSH authorization invalidated")?;
 
-        Ok(SshAuthorization {
-            keys: Some(keys),
-            org_keys: Some(org_keys),
-            lock_generation,
-        })
+        Ok(SshAuthorization::unconfirmed(lock_generation))
     })
     .await
 }
@@ -1252,7 +1246,7 @@ mod tests {
     fn ssh_signature_description_uses_real_newlines() {
         let description = ssh_signature_description("ssh", "SHA256:test");
         assert!(description.contains("request\n\nProcess"));
-        assert!(description.contains("Key: SHA256:test\n\nEnter"));
+        assert!(description.contains("Key: SHA256:test\n\nAllow"));
         assert!(!description.contains(r"\n"));
     }
     #[test]

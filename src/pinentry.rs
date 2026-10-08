@@ -2,7 +2,7 @@ use crate::prelude::*;
 
 use std::convert::TryFrom as _;
 
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 fn escape_assuan_arg(value: &str) -> String {
     value
@@ -113,6 +113,107 @@ pub async fn getpin(
     Ok(crate::locked::Password::new(buf))
 }
 
+pub async fn confirm(
+    pinentry: &str,
+    desc: &str,
+    environment: &crate::protocol::Environment,
+) -> Result<()> {
+    let mut opts = tokio::process::Command::new(pinentry);
+    opts.kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut args = vec!["--timeout".into(), "0".into()];
+    if let Some(tty) = environment.tty() {
+        args.extend(["--ttyname".into(), tty.into()]);
+    } else {
+        opts.env_remove("GPG_TTY").env_remove("TTY");
+    }
+    let env_vars = environment.env_vars();
+    if let Some(display) =
+        env_vars.get(std::ffi::OsString::from("DISPLAY").as_os_str())
+    {
+        args.extend(["--display".into(), display.clone()]);
+    }
+    args.push("--no-global-grab".into());
+    opts.args(args);
+    for env_var in &*crate::protocol::ENVIRONMENT_VARIABLES_OS {
+        if let Some(val) = env_vars.get(env_var) {
+            opts.env(env_var, val);
+        } else {
+            opts.env_remove(env_var);
+        }
+    }
+    opts.envs(env_vars);
+
+    let mut child = opts.spawn().map_err(|source| Error::Spawn { source })?;
+    let mut stdin = child.stdin.take().unwrap();
+    let commands = [
+        "SETTITLE rbw\n".to_string(),
+        format!("SETDESC {}\n", escape_assuan_arg(desc)),
+        "CONFIRM\n".to_string(),
+    ];
+    for command in commands {
+        stdin
+            .write_all(command.as_bytes())
+            .await
+            .map_err(|source| Error::WriteStdin { source })?;
+    }
+    drop(stdin);
+
+    let stdout = child.stdout.take().unwrap();
+    read_confirmation(4, tokio::io::BufReader::new(stdout)).await?;
+    child
+        .wait()
+        .await
+        .map_err(|source| Error::PinentryWait { source })?;
+    Ok(())
+}
+
+async fn read_confirmation<R>(mut ncommands: u8, mut reader: R) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send,
+{
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|source| Error::PinentryReadOutput { source })?;
+        if bytes == 0 {
+            return Err(Error::PinentryReadOutput {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                ),
+            });
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.starts_with("OK") {
+            if ncommands == 1 {
+                return Ok(());
+            }
+            ncommands -= 1;
+        } else if line.starts_with("ERR ") {
+            let mut split = line.splitn(3, ' ');
+            let _ = split.next();
+            let code = split.next();
+            if code == Some("83886179") {
+                return Err(Error::PinentryCancelled);
+            }
+            return Err(Error::PinentryErrorMessage {
+                error: split.next().map_or_else(
+                    || "unknown error".to_string(),
+                    str::to_string,
+                ),
+            });
+        } else if !line.starts_with("S ") {
+            return Err(Error::FailedToParsePinentry {
+                out: line.to_string(),
+            });
+        }
+    }
+}
 async fn read_password<R>(
     mut ncommands: u8,
     data: &mut [u8],
@@ -236,6 +337,24 @@ fn test_escape_assuan_arg() {
         escape_assuan_arg("line 1\nline 2\r100%"),
         "line 1%0Aline 2%0D100%25"
     );
+}
+
+#[test]
+fn test_read_confirmation() {
+    let inputs = [&b"OK\r\nOK\r\nOK\r\nOK\r\n"[..], &b"OK\nOK\nOK\nOK\n"[..]];
+    for input in inputs {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            read_confirmation(4, input).await.unwrap();
+        });
+    }
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let error =
+            read_confirmation(4, &b"OK\nOK\nERR 83886179 canceled\n"[..])
+                .await
+                .unwrap_err();
+        assert!(matches!(error, Error::PinentryCancelled));
+    });
 }
 
 #[test]

@@ -4,12 +4,12 @@
 
 ## Added
 
-* SSH agent signature requests now require the master password through
-  pinentry by default. The prompt identifies the direct requesting process
-  and key fingerprint. Set `ssh_agent_confirmation` to `never` to disable
-  this additional per-signature confirmation; database unlock and item-level
-  master password prompts still apply. Abandoned signature confirmations time
-  out after two minutes.
+* SSH agent signature requests now require an explicit GUI confirmation by
+  default. The prompt identifies the direct requesting process and key
+  fingerprint; it does not request the master password while the Vault is
+  already unlocked. A locked Vault still requires its normal unlock prompt.
+  Set `ssh_agent_confirmation` to `never` to disable this per-signature
+  confirmation. Abandoned confirmations time out after two minutes.
 * Cache normalized SSH public keys after unlock so identity enumeration does
   not require unlocking the Vault. The per-profile, per-account cache contains
   no private keys or entry metadata and is removed by `rbw purge`.

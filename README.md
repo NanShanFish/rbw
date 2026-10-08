@@ -106,9 +106,10 @@ configuration options:
   [pinentry](https://www.gnupg.org/related_software/pinentry/index.html)
   executable to use. Defaults to `pinentry`.
 * `ssh_agent_confirmation`: Controls authorization for SSH agent signatures.
-  Defaults to `always`, which requires the master password through a dedicated
-  GUI pinentry for every signature request. Set it to `never` to disable this
-  additional per-signature confirmation.
+  Defaults to `always`, which shows a dedicated GUI confirmation dialog for
+  every signature request. It does not ask for the master password when the
+  Vault is already unlocked. Set it to `never` to disable this additional
+  per-signature confirmation.
 * `ssh_agent_pinentry`: Optional path or command name for the GUI pinentry used
   only by SSH-agent requests. The agent probes an explicitly configured program
   at startup and rejects terminal-only implementations. With
@@ -207,10 +208,13 @@ from competing with a foreground terminal program for password input.
 
 Every signature request opens the GUI pinentry and shows the direct process
 connected to the agent, its PID when available, and the requested key
-fingerprint. SSH authorization, database unlocks, and item-level re-prompts
-share one pinentry gate. A pinentry transaction, including time spent waiting
-for that gate, is limited to two minutes; timeout stops the pinentry child
-process and releases the gate. To disable this additional confirmation:
+fingerprint. The dialog is a confirmation prompt; it does not require the
+master password when the Vault is already unlocked. If the Vault is locked,
+an accepted confirmation is followed by the normal one-time database unlock
+prompt. SSH authorization, database unlocks, and item-level re-prompts share
+one pinentry gate. A pinentry transaction, including time spent waiting for
+that gate, is limited to two minutes; timeout stops the pinentry child process
+and releases the gate. To disable this additional confirmation:
 
 ```sh
 rbw config set ssh_agent_confirmation never
