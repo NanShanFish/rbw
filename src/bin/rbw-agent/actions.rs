@@ -543,6 +543,15 @@ async fn unlock_state(
     .await
 }
 
+fn ssh_signature_description(
+    requester: &str,
+    key_fingerprint: &str,
+) -> String {
+    format!(
+        "SSH signature request\n\nProcess: {requester}\nKey: {key_fingerprint}\n\nEnter your master password to authorize this request."
+    )
+}
+
 pub async fn authorize_ssh_sign(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     pinentry: Option<&str>,
@@ -567,37 +576,32 @@ pub async fn authorize_ssh_sign(
             "SSH signature confirmation requires a configured GUI pinentry"
         )
     })?;
-    with_pinentry_transaction_timeout(
-        PINENTRY_TRANSACTION_TIMEOUT,
-        async {
-            let pinentry_gate = state.lock().await.pinentry_gate.clone();
-            let _pinentry = pinentry_gate.lock().await;
-            state
-                .lock()
-                .await
-                .ensure_lock_generation(lock_generation)
-                .context("SSH authorization invalidated before prompting")?;
-            let (keys, org_keys) = verify_database_password(
-                pinentry,
-                environment,
-                &format!(
-                    "SSH signature request\\n\\nProcess: {requester}\\nKey: {key_fingerprint}\\n\\nEnter your master password to authorize this request."
-                ),
-            )
-            .await?;
-            state
-                .lock()
-                .await
-                .ensure_lock_generation(lock_generation)
-                .context("SSH authorization invalidated")?;
+    with_pinentry_transaction_timeout(PINENTRY_TRANSACTION_TIMEOUT, async {
+        let pinentry_gate = state.lock().await.pinentry_gate.clone();
+        let _pinentry = pinentry_gate.lock().await;
+        state
+            .lock()
+            .await
+            .ensure_lock_generation(lock_generation)
+            .context("SSH authorization invalidated before prompting")?;
+        let (keys, org_keys) = verify_database_password(
+            pinentry,
+            environment,
+            &ssh_signature_description(requester, key_fingerprint),
+        )
+        .await?;
+        state
+            .lock()
+            .await
+            .ensure_lock_generation(lock_generation)
+            .context("SSH authorization invalidated")?;
 
-            Ok(SshAuthorization {
-                keys: Some(keys),
-                org_keys: Some(org_keys),
-                lock_generation,
-            })
-        },
-    )
+        Ok(SshAuthorization {
+            keys: Some(keys),
+            org_keys: Some(org_keys),
+            lock_generation,
+        })
+    })
     .await
 }
 
@@ -1244,6 +1248,13 @@ mod tests {
         rbw::locked::Keys::new(v)
     }
 
+    #[test]
+    fn ssh_signature_description_uses_real_newlines() {
+        let description = ssh_signature_description("ssh", "SHA256:test");
+        assert!(description.contains("request\n\nProcess"));
+        assert!(description.contains("Key: SHA256:test\n\nEnter"));
+        assert!(!description.contains(r"\n"));
+    }
     #[test]
     fn encrypt_with_item_key_roundtrip() {
         let master = test_keys(1);
