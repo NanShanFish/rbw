@@ -48,7 +48,18 @@ submitted upstream where applicable, but are not guaranteed to be merged.
   mirroring `rbw get --field`. URIs are edited one per line and existing URI
   match types are preserved. (upstream issue
   [doy/rbw#365](https://github.com/doy/rbw/issues/365), PR
-  [doy/rbw#367](https://github.com/doy/rbw/pull/367))
+  [doy/rbw#367](https://github.com/doy/rbw/pull/367)). Custom field edits use
+  decrypted names, prefer exact matches, and reject ambiguous matches.
+  `--create` adds a missing field as a hidden custom field. Piped values keep
+  lines beginning with `#` and trim only one trailing newline. (fork PR
+  [#1](https://github.com/NanShanFish/rbw/pull/1))
+
+* **SSH signing confirmation through GUI pinentry** — every signature requires
+  an explicit confirmation by default. An unlocked Vault does not require the
+  master password again, unless the item's own re-prompt policy requires it.
+  SSH prompts use a dedicated GUI pinentry, including Windows pinentry on WSL,
+  and never reuse a terminal. Cached public keys can be listed while locked.
+  See [SSH Agent](#ssh-agent) for setup and configuration.
 
 * **`rbw-dbcheck`** — a small diagnostic tool that unlocks your local vault and
   reports which entries fail to decrypt, to detect vault corruption.
@@ -57,26 +68,35 @@ submitted upstream where applicable, but are not guaranteed to be merged.
 
 #### Build from source
 
+The SSH confirmation features described below are on the `dev` branch. Build
+that branch to use them:
+
 ```sh
-git clone git@github.com:NanShanFish/rbw.git
+git clone --branch dev git@github.com:NanShanFish/rbw.git
 cd rbw
 cargo build --release --locked
 ```
 
 #### Install the binaries
 
-Replace the system binaries (adjust the destination if you are not on Arch
-Linux; `/usr/sbin` works on most distros):
+For a per-user installation:
 
 ```sh
-sudo install -m755 target/release/rbw target/release/rbw-agent /usr/sbin/
-sudo install -m755 target/release/rbw-dbcheck /usr/sbin/   # optional
+install -d "$HOME/.local/bin"
+install -m755 target/release/rbw target/release/rbw-agent "$HOME/.local/bin/"
+install -m755 target/release/rbw-dbcheck "$HOME/.local/bin/"  # optional
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Note: the `rbw` CLI and `rbw-agent` must be built together — they negotiate a
-protocol version at startup, and mismatched binaries will refuse to talk to
-each other. If an agent from an older build is already running, stop it once
-after installing (`rbw stop-agent`) so the new binaries start.
+Keep `~/.local/bin` in your shell's `PATH` so both the CLI and agent use this
+build. A system-wide installation can use `/usr/local/bin` instead (with the
+appropriate permissions).
+
+The `rbw` CLI and `rbw-agent` must be built and installed together. After an
+upgrade, configure the SSH GUI pinentry as described below, then run
+`rbw stop-agent` and `rbw-agent` to start the new build. An already running
+agent continues using its old executable and startup configuration until it
+is restarted.
 
 ## Configuration
 
@@ -107,9 +127,9 @@ configuration options:
   executable to use. Defaults to `pinentry`.
 * `ssh_agent_confirmation`: Controls authorization for SSH agent signatures.
   Defaults to `always`, which shows a dedicated GUI confirmation dialog for
-  every signature request. It does not ask for the master password when the
-  Vault is already unlocked. Set it to `never` to disable this additional
-  per-signature confirmation.
+  every signature request. This confirmation does not ask for the master
+  password; database unlock and item-level password re-prompts still apply.
+  Set it to `never` to disable this additional per-signature confirmation.
 * `ssh_agent_pinentry`: Optional path or command name for the GUI pinentry used
   only by SSH-agent requests. The agent probes an explicitly configured program
   at startup and rejects terminal-only implementations. With
@@ -160,76 +180,174 @@ the instructions [here](https://bitwarden.com/help/article/personal-api-key/).
 
 ### SSH Agent
 
-`rbw-agent` includes a built-in SSH agent for signing SSH authentication
-challenges directly. To use it, ensure that rbw is running (in order to make
-it start handling ssh agent requests), and then point your SSH client to the
-SSH agent socket:
+`rbw-agent` signs SSH authentication requests using Bitwarden **SSH Key**
+items. Ed25519 and RSA keys are supported; keys stored only in secure notes
+or login custom fields are not offered as SSH identities. There is no need
+to export the private key or import it with `ssh-add`.
 
-```sh
-rbw unlock
-export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/rbw/ssh-agent-socket"
-```
+#### Configure a GUI pinentry
 
-If you're using a profile, the socket will be located at
-`"$XDG_RUNTIME_DIR/rbw-<profile>/ssh-agent-socket"`.
-
-After the first unlock, rbw stores a profile- and account-specific cache of
-SSH public keys. The cache contains only normalized public keys (without
-comments), is written with mode `0600`, and lets `request_identities` and
-`ssh-add -L` work while the Vault is locked. This avoids an extra database
-unlock prompt before the signature confirmation. After upgrading from an
-older rbw version, run `rbw unlock` once to create the cache.
-
-`rbw lock` preserves the public-key cache; `rbw purge` removes it. If a
-background sync completes while the Vault is locked, the cache may keep the
-previous identity list until the next unlock. A removed key can therefore be
-offered once, but signing still checks the current encrypted Vault and fails
-closed. New keys appear after the next unlock.
-
-If `ssh_agent_confirmation` is `always` (the default), the agent requires a
-usable GUI pinentry at startup. Set an explicit executable, for example:
+The default `ssh_agent_confirmation=always` requires a usable GUI pinentry
+before the agent can start. On Linux, install a GUI frontend with its runtime
+dependencies, then configure its executable. For example:
 
 ```sh
 rbw config set ssh_agent_pinentry /usr/bin/pinentry-gnome3
+rbw config set ssh_agent_confirmation always
 ```
 
-On WSL, a Windows pinentry executable can be configured directly, for example:
+`pinentry-qt` is another option. The GUI must be able to access the desktop
+session in which the agent runs. Merely having a binary on disk is not enough
+if its shared libraries or graphical session are unavailable.
+
+On WSL, a Windows GUI pinentry can be invoked through WSL interoperability;
+this does not require a Linux GTK/Qt installation. For a Scoop installation,
+for example (adjust the path to your installation):
 
 ```sh
-rbw config set ssh_agent_pinentry /mnt/c/path/to/pinentry.exe
+rbw config set ssh_agent_pinentry /mnt/d/SoftWare/Scoop/shims/pinentry.exe
+rbw config set ssh_agent_confirmation always
 ```
 
-If no executable is configured, the agent searches `PATH` for known GUI
-pinentry implementations. It validates the selected program with a bounded,
-non-interactive Assuan handshake and refuses to start when the program is
-missing, broken, or terminal-only. SSH-agent requests never fall back to the
-TTY used to start rbw-agent or to a terminal pinentry; this prevents pinentry
-from competing with a foreground terminal program for password input.
+Windows pinentry's CRLF Assuan responses are supported. The ordinary `pinentry`
+setting is independent: it continues to control normal commands such as
+`rbw unlock`, and can still point to a terminal frontend.
 
-Every signature request opens the GUI pinentry and shows the direct process
-connected to the agent, its PID when available, and the requested key
-fingerprint. The dialog is a confirmation prompt; it does not require the
-master password when the Vault is already unlocked. If the Vault is locked,
-an accepted confirmation is followed by the normal one-time database unlock
-prompt. SSH authorization, database unlocks, and item-level re-prompts share
-one pinentry gate. A pinentry transaction, including time spent waiting for
-that gate, is limited to two minutes; timeout stops the pinentry child process
-and releases the gate. To disable this additional confirmation:
+If `ssh_agent_pinentry` is unset, `always` searches `PATH` in this order:
+`pinentry-gnome3`, `pinentry-qt`, `pinentry-qt5`, `pinentry-gui`, `pinentry-gtk`,
+`pinentry-w32`, `pinentry-gtk-2`, `pinentry-mac`, and `pinentry-fltk`. Startup
+checks the version output for a GUI implementation and performs a bounded,
+non-interactive Assuan handshake. It refuses to start if the explicitly
+configured executable fails these checks or no automatic candidate works.
+An invalid explicit path is not replaced by another candidate. The handshake
+does not open a dialog; runtime access to the desktop must still work.
+
+SSH requests never fall back to `pinentry-curses`, `pinentry-tty`, or a
+previous terminal. They pass no TTY and remove inherited `GPG_TTY` and `TTY`,
+avoiding competition with foreground programs for password input.
+
+#### Start the agent and select its socket
+
+After changing the configuration or installing a new build, restart the
+agent. For an account that is already registered and logged in:
+
+```sh
+rbw stop-agent
+rbw-agent
+rbw unlock
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/rbw/ssh-agent-socket"
+else
+    export SSH_AUTH_SOCK="${TMPDIR:-/tmp}/rbw-$(id -u)/ssh-agent-socket"
+fi
+```
+
+With `XDG_RUNTIME_DIR` set, the socket is
+`$XDG_RUNTIME_DIR/rbw/ssh-agent-socket`. Without a runtime directory, the
+fallback is `/tmp/rbw-$(id -u)/ssh-agent-socket` (or under `TMPDIR` if set).
+
+For a profile such as `RBW_PROFILE=work`, use the same profile for configuration
+and agent commands. The corresponding paths are
+`$XDG_RUNTIME_DIR/rbw-work/ssh-agent-socket` or
+`/tmp/rbw-work-$(id -u)/ssh-agent-socket`. Add the appropriate `SSH_AUTH_SOCK`
+export to your shell startup configuration for future terminals.
+
+#### Confirmation and configuration options
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `ssh_agent_confirmation` | `always` | Show a GUI Allow/Cancel dialog for each signature. `never` disables this additional confirmation. |
+| `ssh_agent_pinentry` | Unset | Dedicated GUI executable path or command name for SSH requests. In `always`, an unset value enables GUI discovery. In `never`, an unset value disables SSH-triggered password dialogs. An explicit value is checked at startup in either mode. |
+| `pinentry` | `pinentry` | Frontend for ordinary rbw commands, including manual `rbw unlock`. Independent of the SSH GUI setting. |
+| `lock_timeout` | `3600` seconds | How long the agent retains unlocked Vault keys. After locking, private-key access requires the master password again. |
+
+With `always`, the dialog shows the requested key fingerprint and the direct
+socket peer's process name and PID when available:
+
+```text
+SSH signature request
+
+Process: ssh (pid ...)
+Key: SHA256:...
+
+Allow this signature request?
+```
+
+* **Vault unlocked:** confirm the signature without entering the master password.
+* **Vault locked:** confirm, then enter the master password once to unlock the
+  Vault. Later signatures need only confirmation until the Vault locks again.
+* **Cancel or timeout:** the signature fails with `agent refused operation`.
+* **Item-level master-password re-prompt:** this still applies independently;
+  clicking Allow does not satisfy an item's password requirement.
+
+Confirmation is per signature, not per `ssh` command. A client trying several
+keys may display several dialogs. The process information is advisory: Git
+usually launches `ssh`, and forwarding or proxies expose the intermediary
+rather than the originating application.
+
+SSH confirmations and password prompts share one agent-wide gate. Each
+pinentry transaction has a two-minute budget, including waiting for that gate;
+timeout terminates its pinentry child. An explicit `rbw lock` invalidates
+in-flight authorizations.
+
+To disable per-signature confirmation for automation:
 
 ```sh
 rbw config set ssh_agent_confirmation never
+rbw stop-agent
+rbw-agent
 ```
 
-This does not bypass database locking or item-level master-password re-prompts.
-When confirmation is `never` and `ssh_agent_pinentry` is unset, an SSH request
-that needs a locked Vault fails closed instead of opening a terminal pinentry;
-run `rbw unlock` explicitly first. An SSH Key with master-password re-prompt
-requires `ssh_agent_pinentry` even in `never` mode. Listing identities with
-`ssh-add -L` never triggers the additional per-signature confirmation. Once
-the public-key cache exists, it also does not need to unlock the database.
+This allows signatures without approval while the Vault is unlocked. With no
+`ssh_agent_pinentry` configured, SSH access to a locked Vault fails instead of
+opening a terminal prompt; unlock manually with `rbw unlock` first. An item's
+master-password re-prompt still requires a configured SSH GUI pinentry. A
+headless setup can therefore use `never` with manual unlocking, provided its
+SSH items do not require re-prompts. To remove the GUI setting or restore
+confirmation defaults:
 
-The process shown is the direct Unix socket peer. For example, when OpenSSH
-is used it will normally be `ssh`, not the application that started `ssh`.
+```sh
+rbw config unset ssh_agent_pinentry
+rbw config unset ssh_agent_confirmation  # restores always; requires a usable GUI
+```
+
+Restart the agent after these changes.
+
+#### Public-key cache and verification
+
+After the first unlock, rbw stores a profile- and account-specific cache of
+normalized public keys without comments, with file mode `0600`. Run
+`rbw unlock` once after upgrading to create it. Unlock and sync while unlocked
+refresh the cache; `rbw lock` preserves it and `rbw purge` removes it. A sync
+while locked can leave stale identities until the next unlock. Signing still
+checks the current encrypted Vault: removed keys fail, and new keys appear
+after refreshing the cache.
+
+Verify that listing works while locked without showing pinentry:
+
+```sh
+rbw lock
+ssh-add -L
+rbw unlocked  # expected to report that the agent is locked
+```
+
+Then connect to a host that accepts one of those keys:
+
+```sh
+ssh -o ControlMaster=no -o ControlPath=none user@your-host
+```
+
+With `always`, the first signature should show a confirmation and, if still
+locked, an unlock prompt. A subsequent connection while unlocked should show
+only confirmation, subject to item-level re-prompt policy. Reusing an existing
+SSH connection does not perform a new signature and does not show a dialog.
+Use `ssh -vvv` to distinguish identity listing, server acceptance of a key,
+and a real agent signature request.
+
+If the agent refuses to start, check `rbw config show`, the configured path,
+the GUI runtime dependencies, and the desktop environment available to the
+agent. Closing the terminal that originally launched it should not affect
+Windows GUI pinentry; Linux GUI frontends still need their desktop session.
 
 
 ### 2FA support
